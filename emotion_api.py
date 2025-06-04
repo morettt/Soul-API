@@ -5,8 +5,11 @@ from openai import OpenAI
 import json
 import logging
 import time
+import os
+from datetime import datetime
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
+import threading
 
 # 设置日志
 logging.basicConfig(level=logging.INFO)
@@ -31,9 +34,6 @@ client = OpenAI(api_key=API_KEY, base_url=API_URL)
 # 情绪判断系统提示词
 emotion_system = '你现在是一个情绪判断AI。我会发给你内容。你需要对我发给你的内容进行分析。给出对应的情绪。分别有这4种情绪：喜、怒、哀、乐。你只需要回复里面的一个字即可。禁止输出任何别的内容！别说任何别的内容。我没有在和你对话，不要回复我你自己想要说的内容。只返回情绪标签'
 
-# 全局情绪值存储
-emotion_values = {}
-
 # 情绪分值映射
 emotion_stats = {
     "喜": 2,
@@ -49,6 +49,61 @@ emotion_prompts = {
     "哀伤": "你现在很哀伤。想要大哭来缓解哀伤",
     "喜悦": "你现在很喜悦,想要买一个烟花庆祝"
 }
+
+# 全局情绪数据和锁
+emotion_data = {}
+emotion_lock = threading.Lock()
+
+
+def load_emotion_data():
+    """加载情绪数据文件"""
+    emotion_path = os.path.join(os.path.dirname(__file__), 'emotion.json')
+    try:
+        with open(emotion_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+            logger.info(f"成功加载情绪数据，包含 {len(data.get('users', {}))} 个用户")
+            return data
+    except FileNotFoundError:
+        logger.warning("情绪数据文件未找到，创建新文件")
+        default_data = {"users": {}}
+        save_emotion_data(default_data)
+        return default_data
+    except json.JSONDecodeError as e:
+        logger.error(f"情绪数据文件格式错误: {e}")
+        backup_path = f"{emotion_path}.backup.{int(time.time())}"
+        os.rename(emotion_path, backup_path)
+        logger.info(f"损坏的文件已备份到: {backup_path}")
+        return load_emotion_data()
+
+
+def save_emotion_data(data=None):
+    """保存情绪数据到文件"""
+    if data is None:
+        data = emotion_data
+
+    emotion_path = os.path.join(os.path.dirname(__file__), 'emotion.json')
+
+    try:
+        with emotion_lock:
+            temp_path = emotion_path + '.tmp'
+            with open(temp_path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            os.replace(temp_path, emotion_path)
+        logger.debug("情绪数据已保存")
+    except Exception as e:
+        logger.error(f"保存情绪数据失败: {e}")
+
+
+def get_user_emotion(user_id: str) -> int:
+    """获取用户情绪值"""
+    return emotion_data["users"].get(user_id, 10)
+
+
+def update_user_emotion(user_id: str, new_value: int):
+    """更新用户情绪值并保存到文件"""
+    emotion_data["users"][user_id] = new_value
+    save_emotion_data()
+
 
 def get_emotion_state(emotion_value):
     """根据情绪值返回对应的状态和情绪提示词"""
@@ -84,7 +139,7 @@ async def chat_completions(request: ChatRequest, req: Request):
     try:
         # 获取用户ID和当前情绪值
         user_id = get_user_id(req)
-        current_emotion = emotion_values.get(user_id, 10)
+        current_emotion = get_user_emotion(user_id)
 
         logger.info(f"用户 {user_id} 当前情绪值: {current_emotion}")
 
@@ -112,9 +167,10 @@ async def chat_completions(request: ChatRequest, req: Request):
 
         # 更新情绪值
         if detected_emotion in emotion_stats:
-            current_emotion += emotion_stats[detected_emotion]
-            emotion_values[user_id] = current_emotion
-            logger.info(f"更新后情绪值: {current_emotion}")
+            new_emotion_value = current_emotion + emotion_stats[detected_emotion]
+            update_user_emotion(user_id, new_emotion_value)
+            logger.info(f"更新后情绪值: {new_emotion_value}")
+            current_emotion = new_emotion_value
 
         # 根据情绪值获取情绪提示词
         emotion_state, emotion_prompt = get_emotion_state(current_emotion)
@@ -229,7 +285,7 @@ async def list_models():
 @app.get("/emotion/status/{user_id}")
 async def get_emotion_status(user_id: str):
     """查看指定用户的情绪状态"""
-    current_emotion = emotion_values.get(user_id, 10)
+    current_emotion = get_user_emotion(user_id)
     emotion_state, _ = get_emotion_state(current_emotion)
 
     return {
@@ -239,10 +295,28 @@ async def get_emotion_status(user_id: str):
     }
 
 
+@app.get("/emotion/status")
+async def get_all_emotion_status():
+    """查看所有用户的情绪状态"""
+    users_status = []
+    for user_id, emotion_value in emotion_data["users"].items():
+        emotion_state, _ = get_emotion_state(emotion_value)
+        users_status.append({
+            "user_id": user_id,
+            "emotion_value": emotion_value,
+            "emotion_state": emotion_state
+        })
+
+    return {
+        "total_users": len(users_status),
+        "users": users_status
+    }
+
+
 @app.post("/emotion/reset/{user_id}")
 async def reset_emotion(user_id: str):
     """重置指定用户的情绪值"""
-    emotion_values[user_id] = 10
+    update_user_emotion(user_id, 10)
     return {
         "user_id": user_id,
         "emotion_value": 10,
@@ -250,10 +324,40 @@ async def reset_emotion(user_id: str):
     }
 
 
+@app.post("/emotion/backup")
+async def backup_emotion_data():
+    """备份情绪数据"""
+    timestamp = int(time.time())
+    backup_filename = f"emotion_backup_{timestamp}.json"
+    backup_path = os.path.join(os.path.dirname(__file__), backup_filename)
+
+    try:
+        with open(backup_path, 'w', encoding='utf-8') as f:
+            json.dump(emotion_data, f, ensure_ascii=False, indent=2)
+
+        return {
+            "success": True,
+            "backup_file": backup_filename,
+            "message": f"情绪数据已备份到 {backup_filename}"
+        }
+    except Exception as e:
+        logger.error(f"备份失败: {e}")
+        raise HTTPException(status_code=500, detail=f"备份失败: {str(e)}")
+
+
+# 启动时加载情绪数据
+try:
+    emotion_data = load_emotion_data()
+    logger.info("情绪数据加载完成，服务器准备就绪")
+except Exception as e:
+    logger.error(f"加载情绪数据失败: {e}")
+    raise
+
 if __name__ == '__main__':
     import uvicorn
 
     logger.info("启动情绪AI代理服务器...")
     logger.info("端口: 7000")
     logger.info("API地址: http://localhost:7000/v1/chat/completions")
+    logger.info("情绪数据文件: emotion.json")
     uvicorn.run(app, host='0.0.0.0', port=7000)
