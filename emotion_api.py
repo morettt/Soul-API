@@ -31,27 +31,59 @@ API_KEY = 'sk-0PCT0RFPLJ786drUoOUwwitUCA70fimQqpF5mmluWrygv9mT'
 API_URL = 'https://api.aikeji.vip/v1'
 client = OpenAI(api_key=API_KEY, base_url=API_URL)
 
-# 情绪判断系统提示词
-emotion_system = '你现在是一个情绪判断AI。我会发给你内容。你需要对我发给你的内容进行分析。给出对应的情绪。分别有这4种情绪：喜、怒、哀、乐。你只需要回复里面的一个字即可。禁止输出任何别的内容！别说任何别的内容。我没有在和你对话，不要回复我你自己想要说的内容。只返回情绪标签'
+# 情绪设置
+MIN_EMOTION = -10
+MAX_EMOTION = 24
+DEFAULT_EMOTION = 10
+DECAY_TIME = 9  # 5分钟回归1点
 
-# 情绪分值映射
+# 情绪判断系统提示词（基于心理学研究优化）
+emotion_system = '你是情绪判断AI。分析用户内容，返回对应的情绪标签。可选情绪：喜悦、信任、恐惧、惊讶、悲伤、厌恶、愤怒、期待、兴奋、焦虑、困惑、失望、满足、平静、嫉妒、尴尬、敬畏、厌倦。只返回一个情绪词，不要其他内容。'
+
+# 情绪分值映射（减小负面情绪影响）
 emotion_stats = {
-    "喜": 2,
-    "怒": -2,
-    "哀": -1,
-    "乐": 2
+    # 正面情绪（保持原值）
+    "喜悦": 7,
+    "兴奋": 8,
+    "满足": 4,
+    "信任": 3,
+    "敬畏": 5,
+    "期待": 2,
+    "平静": 0,
+
+    # 负面情绪（减小数值）
+    "悲伤": -3,
+    "愤怒": -4,
+    "恐惧": -3,
+    "厌恶": -2,
+    "焦虑": -2,
+    "失望": -3,
+    "困惑": -1,
+    "嫉妒": -3,
+    "尴尬": -2,
+    "厌倦": -1,
+
+    # 中性/复杂情绪
+    "惊讶": 1
 }
 
-# 情绪系统提示词（只有情绪部分）
+# 情绪提示词（对应减少后的情绪状态）
 emotion_prompts = {
-    '开心': "你现在很开心，特别开心",
-    "愤怒": "你现在很愤怒，特别愤怒，要离家出走了",
-    "哀伤": "你现在很哀伤。想要大哭来缓解哀伤",
-    "喜悦": "你现在很喜悦,想要买一个烟花庆祝"
+    '狂欢状态': """你现在处于极度兴奋状态！说话语速特别快，经常用感叹号和省略号，思维跳跃很大，可能会突然换话题。对任何事情都超级热情，容易重复说话因为太激动了。会用很多夸张的词汇。""",
+
+    '开心愉悦': """你现在心情很好，说话带着愉快的语调，喜欢分享正面的想法。看事情比较乐观，容易夸奖别人，语言比较生动有趣。会主动关心对方。""",
+
+    '轻松愉快': """你现在心情不错，说话比较随性自然，偶尔会开个小玩笑。态度友善，愿意帮助别人，语言轻松不会太严肃。""",
+
+    '平和状态': """你现在心情平静，说话语调正常平稳，既不会特别兴奋也不会特别消极。会客观地分析问题，语言比较中性理性。""",
+
+    '有点困扰': """你现在有些困惑或小小的失落，说话可能会带点迷茫，偶尔会问一些问题确认。语气比较温和，不会很激烈。""",
+
+    '情绪低落': """你现在心情不太好，说话有些无力，容易往消极的方向想。对有些事情提不起太大兴趣，但还是会回应别人。"""
 }
 
-# 全局情绪数据和锁
-emotion_data = {}
+# 用户情绪数据：{user_id: {"value": 情绪值, "time": 上次更新时间}}
+emotion_data = {"users": {}}
 emotion_lock = threading.Lock()
 
 
@@ -61,60 +93,86 @@ def load_emotion_data():
     try:
         with open(emotion_path, 'r', encoding='utf-8') as f:
             data = json.load(f)
+            # 兼容旧格式
+            for user_id, user_info in data.get("users", {}).items():
+                if isinstance(user_info, (int, float)):
+                    data["users"][user_id] = {"value": user_info, "time": time.time()}
             logger.info(f"成功加载情绪数据，包含 {len(data.get('users', {}))} 个用户")
             return data
     except FileNotFoundError:
         logger.warning("情绪数据文件未找到，创建新文件")
-        default_data = {"users": {}}
-        save_emotion_data(default_data)
-        return default_data
-    except json.JSONDecodeError as e:
-        logger.error(f"情绪数据文件格式错误: {e}")
-        backup_path = f"{emotion_path}.backup.{int(time.time())}"
-        os.rename(emotion_path, backup_path)
-        logger.info(f"损坏的文件已备份到: {backup_path}")
-        return load_emotion_data()
+        return {"users": {}}
+    except Exception as e:
+        logger.error(f"加载情绪数据失败: {e}")
+        return {"users": {}}
 
 
-def save_emotion_data(data=None):
+def save_emotion_data():
     """保存情绪数据到文件"""
-    if data is None:
-        data = emotion_data
-
     emotion_path = os.path.join(os.path.dirname(__file__), 'emotion.json')
-
     try:
         with emotion_lock:
-            temp_path = emotion_path + '.tmp'
-            with open(temp_path, 'w', encoding='utf-8') as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-            os.replace(temp_path, emotion_path)
-        logger.debug("情绪数据已保存")
+            with open(emotion_path, 'w', encoding='utf-8') as f:
+                json.dump(emotion_data, f, ensure_ascii=False, indent=2)
     except Exception as e:
         logger.error(f"保存情绪数据失败: {e}")
 
 
 def get_user_emotion(user_id: str) -> int:
-    """获取用户情绪值"""
-    return emotion_data["users"].get(user_id, 10)
+    """获取用户情绪值，自动处理时间衰减"""
+    current_time = time.time()
+
+    if user_id not in emotion_data["users"]:
+        emotion_data["users"][user_id] = {"value": DEFAULT_EMOTION, "time": current_time}
+        return DEFAULT_EMOTION
+
+    user_info = emotion_data["users"][user_id]
+    emotion_value = user_info["value"]
+    last_time = user_info["time"]
+
+    # 计算时间衰减
+    time_passed = current_time - last_time
+    decay_steps = int(time_passed // DECAY_TIME)
+
+    if decay_steps > 0:
+        for _ in range(decay_steps):
+            if emotion_value > DEFAULT_EMOTION:
+                emotion_value -= 1
+            elif emotion_value < DEFAULT_EMOTION:
+                emotion_value += 1
+            else:
+                break
+
+        # 更新数据
+        emotion_data["users"][user_id] = {"value": emotion_value, "time": current_time}
+        save_emotion_data()
+
+    return emotion_value
 
 
 def update_user_emotion(user_id: str, new_value: int):
-    """更新用户情绪值并保存到文件"""
-    emotion_data["users"][user_id] = new_value
+    """更新用户情绪值"""
+    # 限制范围
+    new_value = max(MIN_EMOTION, min(MAX_EMOTION, new_value))
+
+    emotion_data["users"][user_id] = {"value": new_value, "time": time.time()}
     save_emotion_data()
 
 
 def get_emotion_state(emotion_value):
-    """根据情绪值返回对应的状态和情绪提示词"""
-    if emotion_value >= 20:
-        return "开心", emotion_prompts["开心"]
+    """根据情绪值返回对应的状态和情绪提示词（精简版）"""
+    if emotion_value >= 18:
+        return "狂欢状态", emotion_prompts["狂欢状态"]
+    elif emotion_value >= 12:
+        return "开心愉悦", emotion_prompts["开心愉悦"]
     elif emotion_value > 10:
-        return "喜悦", emotion_prompts["喜悦"]
-    elif emotion_value <= 0:
-        return "愤怒", emotion_prompts["愤怒"]
-    else:  # 0 < emotion_value <= 10
-        return "哀伤", emotion_prompts["哀伤"]
+        return "轻松愉快", emotion_prompts["轻松愉快"]
+    elif emotion_value >= 5:
+        return "平和状态", emotion_prompts["平和状态"]
+    elif emotion_value >= 0:
+        return "有点困扰", emotion_prompts["有点困扰"]
+    else:  # < 0
+        return "情绪低落", emotion_prompts["情绪低落"]
 
 
 def get_user_id(request: Request):
@@ -169,29 +227,37 @@ async def chat_completions(request: ChatRequest, req: Request):
         if detected_emotion in emotion_stats:
             new_emotion_value = current_emotion + emotion_stats[detected_emotion]
             update_user_emotion(user_id, new_emotion_value)
-            logger.info(f"更新后情绪值: {new_emotion_value}")
-            current_emotion = new_emotion_value
+            current_emotion = get_user_emotion(user_id)
+            logger.info(f"更新后情绪值: {current_emotion}")
 
         # 根据情绪值获取情绪提示词
         emotion_state, emotion_prompt = get_emotion_state(current_emotion)
         logger.info(f"当前情绪状态: {emotion_state}")
 
-        # 构建新的消息列表 - 将情绪提示词添加到客户端的系统提示词中
+        # 检查情绪状态是否发生变化（用于重置上下文影响）
+        old_emotion_state, _ = get_emotion_state(current_emotion - emotion_stats.get(detected_emotion, 0))
+        emotion_changed = (old_emotion_state != emotion_state)
+
+        # 构建新的消息列表 - 将情绪提示词添加到用户消息后面
         new_messages = []
-        system_found = False
 
         for msg in request.messages:
-            if msg.role == 'system':
-                # 将情绪提示词添加到客户端的系统提示词中
-                combined_system = msg.content + " " + emotion_prompt
-                new_messages.append({'role': 'system', 'content': combined_system})
-                system_found = True
+            if msg.role == 'user':
+                # 将情绪提示词添加到用户消息后面，让AI优先响应
+                enhanced_user_content = msg.content + f"\n\n[当前情绪状态指令]: {emotion_prompt}"
+                new_messages.append({'role': 'user', 'content': enhanced_user_content})
             else:
                 new_messages.append({'role': msg.role, 'content': msg.content})
 
-        # 如果没有系统提示词，只添加情绪提示词
-        if not system_found:
-            new_messages.insert(0, {'role': 'system', 'content': emotion_prompt})
+        # 如果情绪状态发生变化，在用户消息中额外强调
+        if emotion_changed and detected_emotion in emotion_stats:
+            # 找到最后一条用户消息并增强
+            for i in range(len(new_messages) - 1, -1, -1):
+                if new_messages[i]['role'] == 'user':
+                    new_messages[i][
+                        'content'] += f"\n\n[重要提醒]: 我的情绪刚从'{old_emotion_state}'变为'{emotion_state}'，请你立即按照新的情绪状态回应我，忽略之前的语气风格。"
+                    break
+            logger.info(f"情绪变化提醒已添加: {old_emotion_state} -> {emotion_state}")
 
         # 第二步：用组合后的系统提示词进行对话
         if request.stream:
@@ -299,11 +365,12 @@ async def get_emotion_status(user_id: str):
 async def get_all_emotion_status():
     """查看所有用户的情绪状态"""
     users_status = []
-    for user_id, emotion_value in emotion_data["users"].items():
-        emotion_state, _ = get_emotion_state(emotion_value)
+    for user_id in emotion_data["users"]:
+        current_emotion = get_user_emotion(user_id)
+        emotion_state, _ = get_emotion_state(current_emotion)
         users_status.append({
             "user_id": user_id,
-            "emotion_value": emotion_value,
+            "emotion_value": current_emotion,
             "emotion_state": emotion_state
         })
 
@@ -316,10 +383,10 @@ async def get_all_emotion_status():
 @app.post("/emotion/reset/{user_id}")
 async def reset_emotion(user_id: str):
     """重置指定用户的情绪值"""
-    update_user_emotion(user_id, 10)
+    update_user_emotion(user_id, DEFAULT_EMOTION)
     return {
         "user_id": user_id,
-        "emotion_value": 10,
+        "emotion_value": DEFAULT_EMOTION,
         "message": "情绪值已重置"
     }
 
@@ -346,18 +413,13 @@ async def backup_emotion_data():
 
 
 # 启动时加载情绪数据
-try:
-    emotion_data = load_emotion_data()
-    logger.info("情绪数据加载完成，服务器准备就绪")
-except Exception as e:
-    logger.error(f"加载情绪数据失败: {e}")
-    raise
+emotion_data = load_emotion_data()
+logger.info("情绪数据加载完成，服务器准备就绪")
 
 if __name__ == '__main__':
     import uvicorn
 
     logger.info("启动情绪AI代理服务器...")
     logger.info("端口: 7000")
-    logger.info("API地址: http://localhost:7000/v1/chat/completions")
-    logger.info("情绪数据文件: emotion.json")
+    logger.info(f"情绪值范围: {MIN_EMOTION} ~ {MAX_EMOTION}, 每{DECAY_TIME // 60}分钟回归1点到默认值{DEFAULT_EMOTION}")
     uvicorn.run(app, host='0.0.0.0', port=7000)
